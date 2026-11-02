@@ -1,0 +1,263 @@
+/* 文件职责：执行 GPU skinning 模型的 Toon/普通渲染流程。 */
+package com.shiroha.mmdskin.renderer.runtime.model.gpu;
+
+import com.mojang.blaze3d.opengl.GlStateManager;
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.shiroha.mmdskin.config.ConfigManager;
+import com.shiroha.mmdskin.renderer.compat.IrisCompat;
+import com.shiroha.mmdskin.renderer.compat.RenderSystemCompat;
+import com.shiroha.mmdskin.renderer.performance.RenderPerformanceProfiler;
+import com.shiroha.mmdskin.renderer.pipeline.shader.SkinningComputeShader;
+import com.shiroha.mmdskin.renderer.pipeline.shader.ToonShaderCpu;
+import com.shiroha.mmdskin.renderer.pipeline.shader.ToonRenderHelper;
+import com.shiroha.mmdskin.renderer.runtime.model.AbstractMMDModel;
+import com.shiroha.mmdskin.renderer.runtime.model.helper.LightingHelper;
+import com.shiroha.mmdskin.renderer.runtime.model.shared.MMDMaterial;
+import com.shiroha.mmdskin.renderer.runtime.model.shared.SubMeshDrawHelper;
+import com.mojang.blaze3d.opengl.GlTexture;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.renderer.texture.MissingTextureAtlasSprite;
+import net.minecraft.world.entity.Entity;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.joml.Vector3f;
+import org.lwjgl.opengl.GL46C;
+import org.lwjgl.system.MemoryUtil;
+
+final class MMDModelGpuSkinningRenderer {
+    private static final Logger logger = LogManager.getLogger();
+
+    private MMDModelGpuSkinningRenderer() {
+    }
+
+    static void render(MMDModelGpuSkinning target, Entity entityIn, float entityYaw, float entityPitch,
+                       Vector3f entityTrans, PoseStack deliverStack) {
+        Minecraft minecraft = Minecraft.getInstance();
+        LightingHelper.LightData light = LightingHelper.sampleLight(entityIn, minecraft);
+        var workingQuat = target.workingQuaternion();
+        var nativeFunc = target.nativeFunc();
+        long modelHandle = target.nativeModelHandle();
+
+        target.light0Direction.set(1.0f, 0.75f, 0.0f).normalize();
+        target.light1Direction.set(-1.0f, 0.75f, 0.0f).normalize();
+        float yawRad = entityYaw * ((float) Math.PI / 180F);
+        target.light0Direction.rotate(workingQuat.identity().rotateY(yawRad));
+        target.light1Direction.rotate(workingQuat.identity().rotateY(yawRad));
+
+        deliverStack.mulPose(workingQuat.identity().rotateY(-yawRad));
+        deliverStack.mulPose(workingQuat.identity().rotateX(entityPitch * ((float) Math.PI / 180F)));
+        deliverStack.translate(entityTrans.x, entityTrans.y, entityTrans.z);
+        float baseScale = target.modelScaleValue();
+        deliverStack.scale(baseScale, baseScale, baseScale);
+
+        long boneTimer = RenderPerformanceProfiler.get().startTimer();
+        MMDModelGpuSkinningUploader.uploadBoneMatrices(target);
+        RenderPerformanceProfiler.get().endTimer(RenderPerformanceProfiler.SECTION_BONE_UPLOAD, boneTimer);
+
+        long morphTimer = RenderPerformanceProfiler.get().startTimer();
+        if (target.vertexMorphCount > 0) {
+            MMDModelGpuSkinningUploader.uploadMorphData(target);
+        }
+        if (target.uvMorphCount > 0) {
+            MMDModelGpuSkinningUploader.uploadUvMorphData(target);
+        }
+        RenderPerformanceProfiler.get().endTimer(RenderPerformanceProfiler.SECTION_MORPH_UPLOAD, morphTimer);
+
+        if (target.materialMorphResultCountValue() > 0) {
+            long materialMorphTimer = RenderPerformanceProfiler.get().startTimer();
+            target.loadMaterialMorphResults();
+            RenderPerformanceProfiler.get().endTimer(RenderPerformanceProfiler.SECTION_MATERIAL_MORPH_FETCH, materialMorphTimer);
+        }
+
+        long computeTimer = RenderPerformanceProfiler.get().startTimer();
+        MMDModelGpuSkinning.computeShader.dispatch(target.cachedDispatchParams);
+        RenderPerformanceProfiler.get().endTimer(RenderPerformanceProfiler.SECTION_COMPUTE_DISPATCH, computeTimer);
+
+        long subMeshTimer = RenderPerformanceProfiler.get().startTimer();
+        target.subMeshDataBuf.clear();
+        nativeFunc.BatchGetSubMeshData(modelHandle, target.subMeshDataBuf);
+        RenderPerformanceProfiler.get().endTimer(RenderPerformanceProfiler.SECTION_SUB_MESH_FETCH, subMeshTimer);
+
+        boolean useToon = initializeToonShaderIfNeeded();
+
+        /* BufferUploader.reset() removed in 1.21.11 */
+        GL46C.glBindVertexArray(target.vertexArrayObject);
+        GlStateManager._enableBlend();
+        GlStateManager._enableDepthTest();
+        GL46C.glBlendEquation(GL46C.GL_FUNC_ADD);
+        RenderSystemCompat.blendFuncSrcAlphaOneMinusSrcAlpha();
+
+        target.modelViewMatBuff.clear();
+        target.projMatBuff.clear();
+        AbstractMMDModel.computeModelViewMatrix(deliverStack).get(target.modelViewMatBuff);
+        RenderSystemCompat.getProjectionMatrix().get(target.projMatBuff);
+
+        GL46C.glBindBuffer(GL46C.GL_ELEMENT_ARRAY_BUFFER, target.indexBufferObject);
+        target.currentDeliverStack = deliverStack;
+
+        if (useToon && MMDModelGpuSkinning.toonShaderCpu != null && MMDModelGpuSkinning.toonShaderCpu.isInitialized()) {
+            renderToon(target, minecraft, light.intensity());
+        } else {
+            logger.warn("[GPU蒙皮] ToonShaderCpu 未初始化，跳过本帧渲染");
+        }
+
+        cleanupVertexAttributes(target);
+        GL46C.glBindBuffer(GL46C.GL_ARRAY_BUFFER, 0);
+        GL46C.glBindBuffer(GL46C.GL_ELEMENT_ARRAY_BUFFER, 0);
+        GL46C.glBindVertexArray(0);
+        GlStateManager._activeTexture(GL46C.GL_TEXTURE0);
+
+        /* BufferUploader.reset() removed in 1.21.11 */
+    }
+
+    private static boolean initializeToonShaderIfNeeded() {
+        if (!ConfigManager.isToonRenderingEnabled()) {
+            return false;
+        }
+        if (MMDModelGpuSkinning.toonShaderCpu == null) {
+            synchronized (MMDModelGpuSkinning.class) {
+                if (MMDModelGpuSkinning.toonShaderCpu == null) {
+                    ToonShaderCpu shader = new ToonShaderCpu();
+                    if (!shader.init()) {
+                        logger.warn("ToonShaderCpu 初始化失败，回退到普通着色");
+                        return false;
+                    }
+                    MMDModelGpuSkinning.toonShaderCpu = shader;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static void cleanupVertexAttributes(MMDModelGpuSkinning target) {
+        if (target.positionLocation != -1) GL46C.glDisableVertexAttribArray(target.positionLocation);
+        if (target.normalLocation != -1) GL46C.glDisableVertexAttribArray(target.normalLocation);
+        if (target.uv0Location != -1) GL46C.glDisableVertexAttribArray(target.uv0Location);
+        if (target.uv1Location != -1) GL46C.glDisableVertexAttribArray(target.uv1Location);
+        if (target.uv2Location != -1) GL46C.glDisableVertexAttribArray(target.uv2Location);
+        if (target.colorLocation != -1) GL46C.glDisableVertexAttribArray(target.colorLocation);
+        if (target.I_positionLocation != -1) GL46C.glDisableVertexAttribArray(target.I_positionLocation);
+        if (target.I_normalLocation != -1) GL46C.glDisableVertexAttribArray(target.I_normalLocation);
+        if (target.I_uv0Location != -1) GL46C.glDisableVertexAttribArray(target.I_uv0Location);
+        if (target.I_uv2Location != -1) GL46C.glDisableVertexAttribArray(target.I_uv2Location);
+        if (target.I_colorLocation != -1) GL46C.glDisableVertexAttribArray(target.I_colorLocation);
+    }
+
+    private static void renderToon(MMDModelGpuSkinning target, Minecraft minecraft, float lightIntensity) {
+        int missingTextureId = resolveMissingTextureId(minecraft);
+
+        MMDModelGpuSkinning.toonShaderCpu.useMain();
+        int toonPosLoc = MMDModelGpuSkinning.toonShaderCpu.getPositionLocation();
+        int toonNorLoc = MMDModelGpuSkinning.toonShaderCpu.getNormalLocation();
+        int uvLoc = MMDModelGpuSkinning.toonShaderCpu.getUv0Location();
+
+        if (toonPosLoc != -1) {
+            GL46C.glEnableVertexAttribArray(toonPosLoc);
+            GL46C.glBindBuffer(GL46C.GL_ARRAY_BUFFER, target.skinnedPositionsBuffer);
+            GL46C.glVertexAttribPointer(toonPosLoc, 3, GL46C.GL_FLOAT, false, 0, 0);
+        }
+        if (toonNorLoc != -1) {
+            GL46C.glEnableVertexAttribArray(toonNorLoc);
+            GL46C.glBindBuffer(GL46C.GL_ARRAY_BUFFER, target.skinnedNormalsBuffer);
+            GL46C.glVertexAttribPointer(toonNorLoc, 3, GL46C.GL_FLOAT, false, 0, 0);
+        }
+        if (uvLoc != -1) {
+            GL46C.glEnableVertexAttribArray(uvLoc);
+            int toonUvBuffer = target.skinnedUvBuffer > 0 ? target.skinnedUvBuffer : target.uv0BufferObject;
+            GL46C.glBindBuffer(GL46C.GL_ARRAY_BUFFER, toonUvBuffer);
+            GL46C.glVertexAttribPointer(uvLoc, 2, GL46C.GL_FLOAT, false, 0, 0);
+        }
+
+        MMDModelGpuSkinning.toonShaderCpu.setProjectionMatrix(target.projMatBuff);
+        MMDModelGpuSkinning.toonShaderCpu.setModelViewMatrix(target.modelViewMatBuff);
+        ToonRenderHelper.setupToonUniforms(MMDModelGpuSkinning.toonShaderCpu, lightIntensity, target.light0Direction);
+
+        long drawTimer = RenderPerformanceProfiler.get().startTimer();
+        try {
+            drawAllSubMeshes(target, minecraft);
+        } finally {
+            RenderPerformanceProfiler.get().endTimer(RenderPerformanceProfiler.SECTION_DRAW, drawTimer);
+        }
+
+        if (toonPosLoc != -1) GL46C.glDisableVertexAttribArray(toonPosLoc);
+        if (toonNorLoc != -1) GL46C.glDisableVertexAttribArray(toonNorLoc);
+        if (uvLoc != -1) GL46C.glDisableVertexAttribArray(uvLoc);
+
+        if (MMDModelGpuSkinning.toonConfig.isOutlineEnabled()) {
+            MMDModelGpuSkinning.toonShaderCpu.useOutline();
+
+            int posLoc = MMDModelGpuSkinning.toonShaderCpu.getOutlinePositionLocation();
+            int norLoc = MMDModelGpuSkinning.toonShaderCpu.getOutlineNormalLocation();
+
+            if (posLoc != -1) {
+                GL46C.glEnableVertexAttribArray(posLoc);
+                GL46C.glBindBuffer(GL46C.GL_ARRAY_BUFFER, target.skinnedPositionsBuffer);
+                GL46C.glVertexAttribPointer(posLoc, 3, GL46C.GL_FLOAT, false, 0, 0);
+            }
+            if (norLoc != -1) {
+                GL46C.glEnableVertexAttribArray(norLoc);
+                GL46C.glBindBuffer(GL46C.GL_ARRAY_BUFFER, target.skinnedNormalsBuffer);
+                GL46C.glVertexAttribPointer(norLoc, 3, GL46C.GL_FLOAT, false, 0, 0);
+            }
+
+            MMDModelGpuSkinning.toonShaderCpu.setOutlineProjectionMatrix(target.projMatBuff);
+            MMDModelGpuSkinning.toonShaderCpu.setOutlineModelViewMatrix(target.modelViewMatBuff);
+            int outlineUvLoc = MMDModelGpuSkinning.toonShaderCpu.getOutlineUv0Location();
+            if (outlineUvLoc != -1) {
+                GL46C.glEnableVertexAttribArray(outlineUvLoc);
+                int outlineUvBuffer = target.skinnedUvBuffer > 0 ? target.skinnedUvBuffer : target.uv0BufferObject;
+                GL46C.glBindBuffer(GL46C.GL_ARRAY_BUFFER, outlineUvBuffer);
+                GL46C.glVertexAttribPointer(outlineUvLoc, 2, GL46C.GL_FLOAT, false, 0, 0);
+            }
+
+            ToonRenderHelper.setupOutlineUniforms(MMDModelGpuSkinning.toonShaderCpu);
+
+            GlStateManager._depthMask(false);
+            GL46C.glCullFace(GL46C.GL_FRONT);
+            GlStateManager._enableCull();
+            SubMeshDrawHelper.drawOutline(
+                    target.subMeshDataBuf,
+                    target.subMeshCount,
+                    target.indexElementSize,
+                    target.indexType,
+                    materialId -> target.mats[materialId].tex == 0 ? missingTextureId : target.mats[materialId].tex,
+                    (materialId, baseAlpha) -> {
+                        MMDMaterial material = target.mats[materialId];
+                        if (material != null && material.isFacialFeature()) {
+                            return 0.0f;
+                        }
+                        return target.effectiveMaterialAlpha(materialId, baseAlpha);
+                    });
+            GL46C.glCullFace(GL46C.GL_BACK);
+            GlStateManager._depthMask(true);
+            if (posLoc != -1) GL46C.glDisableVertexAttribArray(posLoc);
+            if (norLoc != -1) GL46C.glDisableVertexAttribArray(norLoc);
+            if (outlineUvLoc != -1) GL46C.glDisableVertexAttribArray(outlineUvLoc);
+        }
+
+        GL46C.glUseProgram(0);
+    }
+
+    private static void drawAllSubMeshes(MMDModelGpuSkinning target, Minecraft minecraft) {
+        int missingTextureId = resolveMissingTextureId(minecraft);
+        SubMeshDrawHelper.draw(
+                target.subMeshDataBuf,
+                target.subMeshCount,
+                target.indexElementSize,
+                target.indexType,
+                materialId -> target.mats[materialId].tex == 0 ? missingTextureId : target.mats[materialId].tex,
+                target::effectiveMaterialAlpha);
+    }
+
+    private static int resolveMissingTextureId(Minecraft minecraft) {
+        try {
+            var abstractTexture = minecraft.getTextureManager().getTexture(MissingTextureAtlasSprite.getLocation());
+            var gpuTexture = abstractTexture.getTexture();
+            if (gpuTexture instanceof GlTexture glTexture) {
+                return glTexture.glId();
+            }
+        } catch (Exception ignored) {
+        }
+        return 0;
+    }
+}

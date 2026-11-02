@@ -1,0 +1,558 @@
+package com.shiroha.mmdskin;
+
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import net.minecraft.client.Minecraft;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+/**
+ * 原生库加载器（SRP：仅负责平台检测、库提取/下载/清理/加载）
+ */
+
+public final class NativeLibraryLoader {
+    private static final Logger logger = LogManager.getLogger();
+
+    private static final boolean isAndroid;
+    private static final boolean isLinux;
+    private static final boolean isWindows = System.getProperty("os.name").toLowerCase().contains("windows");
+    private static final boolean isMacOS = System.getProperty("os.name").toLowerCase().contains("mac");
+    private static final boolean isArm64;
+    private static final boolean isLoongArch64;
+    private static final boolean isRiscv64;
+
+    static {
+        String arch = System.getProperty("os.arch").toLowerCase();
+        isArm64 = arch.contains("aarch64") || arch.contains("arm64");
+        isLoongArch64 = arch.contains("loongarch64") || arch.contains("loong64");
+        isRiscv64 = arch.contains("riscv64");
+
+        boolean androidDetected = false;
+        String[] launcherEnvKeys = { "FCL_NATIVEDIR", "POJAV_NATIVEDIR", "MOD_ANDROID_RUNTIME", "FCL_VERSION_CODE" };
+        for (String key : launcherEnvKeys) {
+            String val = System.getenv(key);
+            if (val != null && !val.isEmpty()) {
+                androidDetected = true;
+                break;
+            }
+        }
+        if (!androidDetected) {
+            String androidRoot = System.getenv("ANDROID_ROOT");
+            String androidData = System.getenv("ANDROID_DATA");
+            androidDetected = (androidRoot != null && !androidRoot.isEmpty())
+                           || (androidData != null && !androidData.isEmpty());
+        }
+        if (!androidDetected) {
+            try {
+                androidDetected = new File("/system/build.prop").exists();
+            } catch (Exception ignored) {}
+        }
+        if (!androidDetected) {
+            String vendor = System.getProperty("java.vendor", "").toLowerCase();
+            String vmName = System.getProperty("java.vm.name", "").toLowerCase();
+            androidDetected = vendor.contains("android") || vmName.contains("dalvik") || vmName.contains("art");
+        }
+        isAndroid = androidDetected;
+        isLinux = System.getProperty("os.name").toLowerCase().contains("linux") && !isAndroid;
+    }
+
+    public static boolean isAndroid() { return isAndroid; }
+
+    static final String LIBRARY_VERSION = "v1.0.4";
+
+    private static final String RELEASE_TAG = "v1.0.4-1.21.1";
+
+    private static final String RELEASE_BASE_URL =
+            "https://github.com/shiroha-233/MC-MMD-rust/releases/download/" + RELEASE_TAG + "/";
+
+    private static final String ENGINE_LIBRARY_DIR_NAME = "mmdskin-natives";
+
+    private static volatile String gameDirectory;
+    private static final Object DIR_LOCK = new Object();
+
+    private static String getGameDirectory() {
+        if (gameDirectory == null) {
+            synchronized (DIR_LOCK) {
+                if (gameDirectory == null) {
+                    gameDirectory = Minecraft.getInstance().gameDirectory.getAbsolutePath();
+                }
+            }
+        }
+        return gameDirectory;
+    }
+
+    private static File getEngineLibraryDir() {
+        File dir = new File(getGameDirectory(), ENGINE_LIBRARY_DIR_NAME);
+        if (!dir.exists() && !dir.mkdirs()) {
+            if (!isAndroid) {
+                logger.warn("无法创建原生库目录: " + dir.getAbsolutePath());
+            }
+        }
+        return dir;
+    }
+
+    private NativeLibraryLoader() {}
+
+    static void loadAndVerify(NativeFunc instance) {
+        if (isAndroid) {
+            loadAndroid();
+        } else {
+            loadDesktop();
+        }
+        verifyLoadedLibraryVersion(instance);
+    }
+
+    private static void loadDesktop() {
+        String resourcePath;
+        String fileName;
+        String downloadFileName;
+
+        if (isWindows) {
+            String archDir = isArm64 ? "windows-arm64" : "windows-x64";
+            logger.info("Windows Env Detected! Arch: " + archDir);
+            resourcePath = "/natives/" + archDir + "/mmd_engine.dll";
+            fileName = "mmd_engine.dll";
+            downloadFileName = "mmd_engine-" + archDir + ".dll";
+        } else if (isMacOS) {
+            String archDir = isArm64 ? "macos-arm64" : "macos-x64";
+            logger.info("macOS Env Detected! Arch: " + archDir);
+            resourcePath = "/natives/" + archDir + "/libmmd_engine.dylib";
+            fileName = "libmmd_engine.dylib";
+            downloadFileName = "libmmd_engine-" + archDir + ".dylib";
+        } else if (isLinux) {
+            String archDir;
+            if (isArm64) {
+                archDir = "linux-arm64";
+            } else if (isLoongArch64) {
+                archDir = "linux-loongarch64";
+            } else if (isRiscv64) {
+                archDir = "linux-riscv64";
+            } else {
+                archDir = "linux-x64";
+            }
+            logger.info("Linux Env Detected! Arch: " + archDir);
+            resourcePath = "/natives/" + archDir + "/libmmd_engine.so";
+            fileName = "libmmd_engine.so";
+            downloadFileName = "libmmd_engine-" + archDir + ".so";
+        } else {
+            String osName = System.getProperty("os.name");
+            logger.error("不支持的操作系统: " + osName);
+            throw new UnsupportedOperationException("Unsupported OS: " + osName);
+        }
+
+        File engineDir = getEngineLibraryDir();
+        logger.info("原生库目录: " + engineDir.getAbsolutePath());
+        cleanupOldLibraries(fileName, downloadFileName, engineDir);
+
+        File existingEngine = findEngineLibraryFile(engineDir, fileName, downloadFileName);
+        if (existingEngine != null) {
+            try {
+                System.load(existingEngine.getAbsolutePath());
+                return;
+            } catch (Error e) {
+                logger.error("外置库加载失败: " + e.getClass().getName() + ": " + e.getMessage(), e);
+            }
+        }
+
+        File extracted = extractNativeLibrary(resourcePath, fileName, engineDir);
+        if (extracted != null) {
+            try {
+                System.load(extracted.getAbsolutePath());
+                return;
+            } catch (Error e) {
+                logger.error("内置库加载失败: " + e.getClass().getName() + ": " + e.getMessage(), e);
+            }
+        }
+
+        File downloaded = downloadNativeLibrary(downloadFileName, engineDir);
+        if (downloaded != null) {
+            try {
+                System.load(downloaded.getAbsolutePath());
+                return;
+            } catch (Error e) {
+                logger.error("下载的库加载失败: " + e.getClass().getName() + ": " + e.getMessage(), e);
+            }
+        }
+
+        throw new UnsatisfiedLinkError("无法加载原生库: " + getVersionedFileName(fileName)
+                + "，请检查网络连接或从 " + RELEASE_BASE_URL + " 手动下载并放入 "
+                + engineDir.getAbsolutePath());
+    }
+
+    private static void loadAndroid() {
+        String archDir = "android-a" + (isArm64 ? "rm" : "md") + "64";
+
+        String soFileName = "libmmd_engine.so";
+        String downloadFileName = "libmmd_engine-" + archDir + ".so";
+
+        File engineDir = getEngineLibraryDir();
+        cleanupOldLibraries(soFileName, downloadFileName, engineDir);
+
+        boolean isLibcLoaded = isLibcLoaded();
+        String libcPath = null;
+        if (!isLibcLoaded) {
+            try {
+                libcPath = findLibcPath();
+            } catch (Throwable t) {
+                libcPath = null;
+            }
+        }
+
+        if (!isLibcLoaded && libcPath != null) {
+            try {
+                System.load(libcPath);
+                isLibcLoaded = true;
+            } catch (Throwable e) {
+                libcPath = null;
+            }
+        }
+
+        File engineLibrary = findEngineLibraryFile(engineDir, soFileName, downloadFileName);
+        if (engineLibrary == null) {
+            engineLibrary = downloadNativeLibrary(downloadFileName, engineDir);
+        }
+
+        if (tryLoadAndroidEngine(engineLibrary)) {
+            return;
+        }
+
+        throw new UnsatisfiedLinkError("[Android] 无法加载原生库 libmmd_engine.so。"
+                + "请检查网络连接或从 " + RELEASE_BASE_URL + " 手动下载并放入 "
+                + engineDir.getAbsolutePath());
+    }
+
+    private static boolean isLibcLoaded() {
+        try {
+            java.lang.reflect.Field field = ClassLoader.class.getDeclaredField("loadedLibraryNames");
+            field.setAccessible(true);
+            Object value = field.get(ClassLoader.getSystemClassLoader());
+            if (value instanceof java.util.Vector) {
+                for (Object item : (java.util.Vector<?>) value) {
+                    if (item instanceof String && ((String) item).endsWith("libc++_shared.so")) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    private static String findLibcPath() {
+        String[] candidates = new String[] {
+                "/apex/com.android.runtime/lib64/libc++_shared.so",
+                "/apex/com.android.runtime/lib/libc++_shared.so",
+                "/system/lib64/libc++_shared.so",
+                "/system/lib/libc++_shared.so",
+                "/vendor/lib64/libc++_shared.so",
+                "/vendor/lib/libc++_shared.so"
+        };
+        for (String path : candidates) {
+            try {
+                File file = new File(path);
+                if (file.isFile()) {
+                    return file.getAbsolutePath();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static File getAndroidTempNativeDir() {
+        File tempDir = new File(System.getProperty("java.io.tmpdir"), "mmdskin-natives");
+        if (!tempDir.exists()) {
+            tempDir.mkdirs();
+        }
+        return tempDir.isDirectory() ? tempDir : null;
+    }
+
+    private static boolean shouldCopyLibrary(File source, File target) {
+        if (source == null || target == null) {
+            return false;
+        }
+        if (!target.exists()) {
+            return true;
+        }
+        long sourceSize = source.length();
+        long targetSize = target.length();
+        if (sourceSize != targetSize) {
+            return true;
+        }
+        return source.lastModified() > target.lastModified();
+    }
+
+    private static File copyToTempDir(File source, File tempDir) {
+        if (source == null || tempDir == null) {
+            return null;
+        }
+        try {
+            File target = new File(tempDir, source.getName());
+            if (shouldCopyLibrary(source, target)) {
+                Files.copy(source.toPath(), target.toPath(),
+                        StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.COPY_ATTRIBUTES);
+            }
+            return target;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static boolean tryLoadAndroidEngine(File source) {
+        if (source == null) {
+            return false;
+        }
+        File tempDir = getAndroidTempNativeDir();
+        if (tempDir == null) {
+            return false;
+        }
+        File copied = copyToTempDir(source, tempDir);
+        if (copied == null) {
+            return false;
+        }
+        try {
+            System.load(copied.getAbsolutePath());
+            return true;
+        } catch (Throwable e) {
+            return false;
+        }
+    }
+
+    private static File findEngineLibraryFile(File dir, String fileName, String downloadFileName) {
+        if (dir == null) {
+            return null;
+        }
+        java.util.ArrayList<String> names = new java.util.ArrayList<>();
+        if (fileName != null && !fileName.isEmpty()) {
+            names.add(fileName);
+            names.add(getVersionedFileName(fileName));
+        }
+        if (downloadFileName != null && !downloadFileName.isEmpty()) {
+            names.add(downloadFileName);
+            names.add(getVersionedFileName(downloadFileName));
+        }
+        for (String name : names) {
+            File direct = new File(dir, name);
+            if (direct.isFile()) {
+                return direct;
+            }
+        }
+        return null;
+    }
+
+    private static boolean ensureLibcLoaded(String libcResource, String libcFileName, File targetDir) {
+        return isLibcLoaded();
+    }
+
+    private static String getVersionedFileName(String baseFileName) {
+        int dotIndex = baseFileName.lastIndexOf('.');
+        if (dotIndex > 0) {
+            return baseFileName.substring(0, dotIndex) + "_" + RELEASE_TAG + baseFileName.substring(dotIndex);
+        }
+        return baseFileName + "_" + RELEASE_TAG;
+    }
+
+    private static File extractNativeLibrary(String resourcePath, String fileName) {
+        return extractNativeLibrary(resourcePath, fileName, getEngineLibraryDir());
+    }
+
+    private static File extractNativeLibrary(String resourcePath, String fileName, File targetDir) {
+        try {
+            String versionedName = getVersionedFileName(fileName);
+            if (targetDir == null) {
+                targetDir = getEngineLibraryDir();
+            }
+            if (!targetDir.exists() && !targetDir.mkdirs()) {
+                logger.warn("无法创建目标目录: " + targetDir);
+            }
+            if (!targetDir.canWrite()) {
+                logger.warn("目标目录不可写: " + targetDir);
+                targetDir = getEngineLibraryDir();
+                if (!targetDir.exists()) {
+                    targetDir.mkdirs();
+                }
+            }
+
+            Path targetPath = Paths.get(targetDir.getAbsolutePath(), versionedName);
+            File targetFile = targetPath.toFile();
+
+            if (targetFile.exists()) {
+                return targetFile;
+            }
+
+            try (InputStream is = NativeLibraryLoader.class.getResourceAsStream(resourcePath)) {
+                if (is == null) {
+                    logger.warn("内置原生库未找到: " + resourcePath);
+                    return null;
+                }
+                Path tempPath = Paths.get(targetDir.getAbsolutePath(), versionedName + ".tmp");
+                Files.copy(is, tempPath, StandardCopyOption.REPLACE_EXISTING);
+                Files.move(tempPath, targetPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            return targetFile;
+        } catch (Exception e) {
+            logger.error("提取原生库失败: " + resourcePath + " - " + e.getMessage());
+            return null;
+        }
+    }
+
+    private static File downloadNativeLibrary(String downloadFileName) {
+        return downloadNativeLibrary(downloadFileName, getEngineLibraryDir());
+    }
+
+    private static File downloadNativeLibrary(String downloadFileName, File targetDir) {
+        try {
+            String versionedName = getVersionedFileName(downloadFileName);
+            if (targetDir == null) {
+                targetDir = getEngineLibraryDir();
+            }
+            if (!targetDir.exists() && !targetDir.mkdirs()) {
+                if (!isAndroid) {
+                    logger.warn("无法创建目标目录: " + targetDir);
+                }
+            }
+            if (!targetDir.canWrite()) {
+                if (!isAndroid) {
+                    logger.warn("目标目录不可写: " + targetDir);
+                }
+                targetDir = getEngineLibraryDir();
+                if (!targetDir.exists()) {
+                    targetDir.mkdirs();
+                }
+            }
+
+            Path targetPath = Paths.get(targetDir.getAbsolutePath(), versionedName);
+
+            if (targetPath.toFile().exists()) {
+                return targetPath.toFile();
+            }
+
+            String urlStr = RELEASE_BASE_URL + versionedName;
+
+            HttpURLConnection conn = null;
+            for (int i = 0; i < 5; i++) {
+                conn = (HttpURLConnection) new URL(urlStr).openConnection();
+                conn.setInstanceFollowRedirects(false);
+                conn.setConnectTimeout(15000);
+                conn.setReadTimeout(60000);
+                conn.setRequestProperty("User-Agent", "MMDSkin-Mod/" + LIBRARY_VERSION);
+
+                int code = conn.getResponseCode();
+                if (code == HttpURLConnection.HTTP_MOVED_TEMP
+                        || code == HttpURLConnection.HTTP_MOVED_PERM
+                        || code == 307 || code == 308) {
+                    urlStr = conn.getHeaderField("Location");
+                    conn.disconnect();
+                    continue;
+                }
+                break;
+            }
+
+            if (conn == null || conn.getResponseCode() != 200) {
+                if (!isAndroid) {
+                    logger.warn("下载失败，HTTP 状态码: " + (conn != null ? conn.getResponseCode() : "无连接"));
+                }
+                if (conn != null) conn.disconnect();
+                return null;
+            }
+
+            long contentLength = conn.getContentLengthLong();
+
+            Path tempPath = Paths.get(targetDir.getAbsolutePath(), versionedName + ".download");
+            try (InputStream is = conn.getInputStream()) {
+                Files.copy(is, tempPath, StandardCopyOption.REPLACE_EXISTING);
+            }
+
+            Files.move(tempPath, targetPath, StandardCopyOption.REPLACE_EXISTING);
+            conn.disconnect();
+            return targetPath.toFile();
+        } catch (Exception e) {
+            if (!isAndroid) {
+                logger.error("下载原生库失败: " + downloadFileName + " - " + e.getMessage());
+            }
+            try {
+                Files.deleteIfExists(Paths.get(targetDir.getAbsolutePath(), getVersionedFileName(downloadFileName) + ".download"));
+            } catch (Exception ignored) {}
+            return null;
+        }
+    }
+
+    private static void cleanupOldLibraries(String baseFileName, String downloadBaseFileName) {
+        cleanupOldLibraries(baseFileName, downloadBaseFileName, getEngineLibraryDir());
+    }
+
+    private static void cleanupOldLibraries(String baseFileName, String downloadBaseFileName, File targetDir) {
+        try {
+            File gameDir = targetDir != null ? targetDir : getEngineLibraryDir();
+            int dotIndex = baseFileName.lastIndexOf('.');
+            if (dotIndex <= 0) return;
+
+            String baseName = baseFileName.substring(0, dotIndex);
+            String ext = baseFileName.substring(dotIndex);
+            String currentVersionedLocal = getVersionedFileName(baseFileName);
+            String currentVersionedDownload = getVersionedFileName(downloadBaseFileName);
+
+            File[] files = gameDir.listFiles();
+            if (files == null) return;
+
+            for (File f : files) {
+                String name = f.getName();
+                if (name.equals(currentVersionedLocal) || name.equals(currentVersionedDownload)) continue;
+
+                boolean shouldDelete = false;
+
+                if (name.startsWith(baseName) && name.contains("_v") && (name.endsWith(ext)
+                        || name.endsWith(ext + ".download") || name.endsWith(ext + ".tmp"))) {
+                    shouldDelete = true;
+                }
+                if (name.equals(baseFileName)
+                        || name.equals(baseFileName + ".version")
+                        || name.equals(baseFileName + ".old")
+                        || name.equals(baseFileName + ".new")
+                        || name.equals(baseFileName + ".download")) {
+                    shouldDelete = true;
+                }
+
+                if (shouldDelete) {
+                    try {
+                        if (f.delete()) {
+                        }
+                    } catch (Exception e) {
+                        if (!isAndroid) {
+                            logger.debug("清理旧文件失败（可能仍被锁定）: " + name);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            if (!isAndroid) {
+                logger.debug("清理旧版本库文件时出错: " + e.getMessage());
+            }
+        }
+    }
+
+    private static void verifyLoadedLibraryVersion(NativeFunc instance) {
+        try {
+            String rustVersion = instance.GetVersion();
+            if (LIBRARY_VERSION.equals(rustVersion)) {
+                return;
+            }
+            if (!isAndroid) {
+                logger.warn("原生库版本不匹配！Java 侧期望: " + LIBRARY_VERSION + ", Rust 侧实际: " + rustVersion);
+                logger.warn("这通常发生在开发环境或手动放置库文件时，请确保 Rust 引擎和 Java 模组版本一致。");
+            }
+        } catch (Exception | Error e) {
+            if (!isAndroid) {
+                logger.warn("运行时版本校验失败（GetVersion 调用异常）: " + e.getMessage());
+            }
+        }
+    }
+}

@@ -1,0 +1,39 @@
+{
+	"schemaVersion": 1,
+	"id": "mmdskin",
+	"version": "${version}",
+	"name": "MMD Skin",
+	"description": "A mod that replaces Minecraft entity rendering with MMD models",
+	"authors": [
+		"shiroha233",
+		"kjkjkAIStudio(原作者)",
+		"asuka-mio",
+		"Gengorou-C"
+	],
+	"contact": {
+		"homepage": "https://github.com/shiroha233/3d-skin-layers",
+		"sources": "https://github.com/shiroha233/3d-skin-layers"
+	},
+	"license": "MIT",
+	"icon": "icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.shiroha.mmdskin.fabric.MmdSkinFabric"
+		],
+		"client": [
+			"com.shiroha.mmdskin.fabric.MmdSkinFabricClient"
+		]
+	},
+	"mixins": [
+		"mmdskin-fabric.mixins.json",
+		"mmdskin-maid.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.16.0",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*",
+		"cloth-config": "*"
+	}
+}

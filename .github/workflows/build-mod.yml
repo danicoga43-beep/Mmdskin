@@ -1,12 +1,12 @@
-# Build otomatis mod MMD (Fabric 1.21.11) di GitHub.
-# Jalan tiap push ke main/master, pull request, atau manual (tab Actions > Run workflow).
-# Hasil: file .jar ada di halaman run > Artifacts (mmdskin-fabric-jar).
+# Build otomatis mod MMD (Fabric 1.21.11) - FOKUS ANDROID (arm64).
+# Jalan tiap push ke main/master atau manual (Actions > Run workflow).
+# Hasil: Artifacts > mmdskin-fabric-jar (jar mod) dan native-android-arm64 (libmmd_engine.so).
+# Kalau gagal: lihat bagian "Annotations" di halaman ringkasan run, ada baris error Rust/Gradle yang sebenarnya.
 name: Build Fabric (otomatis)
 
 on:
   push:
     branches: [main, master]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -14,70 +14,116 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: never
 
 jobs:
-  # ---------- 1) Library native Rust (Android arm64 untuk HP, Windows & Linux untuk PC) ----------
+  # ---------- 1) Library native Rust untuk Android arm64 ----------
   natives:
-    name: native ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { name: android-arm64, os: ubuntu-latest,  target: aarch64-linux-android,   lib: libmmd_engine.so }
-          - { name: windows-x64,   os: windows-latest, target: x86_64-pc-windows-msvc,   lib: mmd_engine.dll }
-          - { name: linux-x64,     os: ubuntu-latest,  target: x86_64-unknown-linux-gnu, lib: libmmd_engine.so }
+    name: native android-arm64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # Kalau repo dibuat dengan upload file biasa, folder submodule bullet3 kosong -> clone sendiri
-      - name: Pastikan bullet3 ada
-        shell: bash
+      - name: Cek berkas penting
         run: |
-          if [ ! -d rust_engine/deps/bullet3/src ]; then
+          {
+            echo "== rust_engine =="; ls rust_engine || true
+            echo "== rust_engine/src/bin =="; ls -R rust_engine/src/bin 2>&1 | head -20 || true
+            echo "== bullet3/src ada? =="; ls rust_engine/deps/bullet3/src 2>&1 | head -5 || true
+            echo "== bullet_wrapper =="; ls rust_engine/bullet_wrapper 2>&1 | head || true
+            echo "== rust_engine/src =="; ls rust_engine/src 2>&1 | head -30 || true
+          } 2>&1 | tee diag.log
+
+      # .gitignore proyek berisi "bin/" -> folder rust_engine/src/bin sering hilang saat di-commit lewat git.
+      # Cargo.toml menyebut file itu, jadi tanpa ini cargo langsung gagal (exit 101). Bikin stub kosong kalau hilang.
+      - name: Pulihkan target bin yang hilang
+        run: |
+          for f in rust_engine/src/bin/viewer/main.rs rust_engine/src/bin/vrdemo-old/main.rs; do
+            if [ ! -f "$f" ]; then
+              echo "hilang: $f -> dibuat stub"
+              mkdir -p "$(dirname "$f")"
+              echo "fn main() {}" > "$f"
+            fi
+          done
+
+      # Kalau repo dibuat dengan upload biasa, folder submodule bullet3 kosong -> clone sendiri
+      - name: Pastikan bullet3 ada
+        run: |
+          if [ ! -d rust_engine/deps/bullet3/src/LinearMath ]; then
             rm -rf rust_engine/deps/bullet3
             git clone --depth 1 https://github.com/bulletphysics/bullet3.git rust_engine/deps/bullet3
           fi
+          ls rust_engine/deps/bullet3/src | head -5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-linux-android
 
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust_engine
 
       - name: Setup Android NDK
-        if: matrix.name == 'android-arm64'
         uses: nttld/setup-ndk@v1
         id: ndk
         with:
           ndk-version: r27c
 
-      - name: Build (Android arm64)
-        if: matrix.name == 'android-arm64'
-        shell: bash
+      - name: Build native Android arm64
+        id: cargo
         run: |
+          set -o pipefail
           BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
           export ANDROID_NDK_HOME="${{ steps.ndk.outputs.ndk-path }}"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$BIN/aarch64-linux-android24-clang"
           export CC_aarch64_linux_android="$BIN/aarch64-linux-android24-clang"
           export CXX_aarch64_linux_android="$BIN/aarch64-linux-android24-clang++"
           export AR_aarch64_linux_android="$BIN/llvm-ar"
-          cargo build --release --manifest-path rust_engine/Cargo.toml --target ${{ matrix.target }}
+          cargo build --release --manifest-path rust_engine/Cargo.toml --target aarch64-linux-android 2>&1 | tee build.log
 
-      - name: Build (desktop)
-        if: matrix.name != 'android-arm64'
-        shell: bash
-        run: cargo build --release --manifest-path rust_engine/Cargo.toml --target ${{ matrix.target }}
+      - name: Ringkasan log Rust
+        if: always()
+        env:
+          OUTCOME: ${{ steps.cargo.outcome }}
+        run: |
+          {
+            echo "## Native Android arm64 - build: **${OUTCOME:-tidak sampai dijalankan}**"
+            if [ "$OUTCOME" != "success" ] && [ -f build.log ]; then
+              echo "### Baris error"
+              echo '```'
+              grep -n -E "^error|panicked|error\[|failed to|could not|can't find|No such file|linker" build.log | head -25 || true
+              echo '```'
+              echo "### 60 baris terakhir"
+              echo '```'
+              tail -n 60 build.log
+              echo '```'
+            fi
+            echo "### Berkas di repo"
+            echo '```'
+            cat diag.log 2>/dev/null || echo "(diag.log tidak ada)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" = "failure" ]; then
+            MSG=$(grep -E "^error|panicked|failed to|could not|can't find|No such file" build.log | head -6 | sed 's/%/%25/g' | tr '\n' ' ')
+            echo "::error title=Rust gagal::${MSG:-lihat Summary di halaman run}"
+          fi
+
+      - name: Simpan log lengkap
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-native
+          path: |
+            build.log
+            diag.log
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
-          name: native-${{ matrix.name }}
-          path: rust_engine/target/${{ matrix.target }}/release/${{ matrix.lib }}
+          name: native-android-arm64
+          path: rust_engine/target/aarch64-linux-android/release/libmmd_engine.so
           if-no-files-found: error
 
   # ---------- 2) Jar mod Fabric ----------
@@ -90,7 +136,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: native-*
+          name: native-android-arm64
           path: native-libs
 
       - name: Setup Android NDK (untuk libc++_shared.so)
@@ -101,12 +147,10 @@ jobs:
 
       - name: Salin native ke resources
         run: |
-          R=common/src/main/resources/natives
-          mkdir -p $R/windows-x64 $R/linux-x64 $R/android-arm64
-          cp native-libs/native-windows-x64/mmd_engine.dll    $R/windows-x64/
-          cp native-libs/native-linux-x64/libmmd_engine.so    $R/linux-x64/
-          cp native-libs/native-android-arm64/libmmd_engine.so $R/android-arm64/
-          cp "${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" $R/android-arm64/
+          R=common/src/main/resources/natives/android-arm64
+          mkdir -p $R
+          cp native-libs/libmmd_engine.so $R/
+          cp "${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" $R/
 
       - uses: actions/setup-java@v4
         with:
@@ -116,13 +160,47 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
 
       - name: Build Fabric
+        id: gradle
         run: |
+          set -o pipefail
           chmod +x gradlew
-          ./gradlew :fabric:build -x test --no-daemon --console=plain
+          ./gradlew :fabric:build -x test --no-daemon --console=plain 2>&1 | tee gradle.log
 
-      - name: Ambil versi
-        id: ver
-        run: echo "v=$(grep "version = '" build.gradle | head -1 | sed "s/.*version = '//;s/'.*//")" >> "$GITHUB_OUTPUT"
+      - name: Ringkasan log Gradle
+        if: always()
+        env:
+          OUTCOME: ${{ steps.gradle.outcome }}
+        run: |
+          {
+            echo "## Jar Fabric 1.21.11 - build: **${OUTCOME:-tidak sampai dijalankan}**"
+            if [ "$OUTCOME" != "success" ] && [ -f gradle.log ]; then
+              echo "### Baris error"
+              echo '```'
+              grep -n -E "error:|What went wrong|FAILED|Could not|Unsupported|Execution failed|cannot find symbol" -A3 gradle.log | head -50 || true
+              echo '```'
+              echo "### 60 baris terakhir"
+              echo '```'
+              tail -n 60 gradle.log
+              echo '```'
+            fi
+            echo "### Native yang masuk ke jar"
+            echo '```'
+            ls -la common/src/main/resources/natives/android-arm64 2>&1 || true
+            ls -la fabric/build/libs 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" = "failure" ]; then
+            MSG=$(grep -E "error:|What went wrong|FAILED|Could not|Unsupported" -A2 gradle.log | head -8 | sed 's/%/%25/g' | tr '\n' ' ')
+            echo "::error title=Gradle gagal::${MSG:-lihat Summary di halaman run}"
+          fi
+
+      - name: Simpan log lengkap
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-gradle
+          path: gradle.log
+          if-no-files-found: ignore
 
       - uses: actions/upload-artifact@v4
         with:
@@ -132,13 +210,3 @@ jobs:
             !fabric/build/libs/*-dev*.jar
             !fabric/build/libs/*-sources*.jar
           if-no-files-found: error
-
-      # Tag v* -> otomatis jadi Release (jar + library native Android untuk folder mmdskin-natives)
-      - name: Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: |
-            fabric/build/libs/mmdskin-fabric-*.jar
-            native-libs/native-android-arm64/libmmd_engine.so
